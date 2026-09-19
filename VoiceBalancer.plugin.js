@@ -3,8 +3,8 @@
  * @author lukej
  * @version 0.1.0
  * @description Automatically balances how loud everyone in a voice channel sounds. Learns each person's speaking level and adjusts their per-user volume so nobody blows out your ears and nobody is a whisper.
- * @source https://github.com/lukej/VoiceBalancer
- * @updateUrl https://raw.githubusercontent.com/lukej/VoiceBalancer/main/VoiceBalancer.plugin.js
+ * @source https://github.com/lukejdid-star/VoiceBalancer
+ * @updateUrl https://raw.githubusercontent.com/lukejdid-star/VoiceBalancer/main/VoiceBalancer.plugin.js
  */
 
 "use strict";
@@ -189,7 +189,10 @@ class VoiceBalancer {
     }
 
     setVolume(userId, volume) {
-        const v = Math.round(Math.max(0, Math.min(400, volume)) * 100) / 100;
+        // Hard ceiling at Discord's own limit. Values above 200 are accepted by
+        // setLocalVolume but the audio context settings sync reverts them, so
+        // going higher would just produce volumes that silently snap back.
+        const v = Math.round(Math.max(0, Math.min(200, volume)) * 100) / 100;
         this._applying = true;
         try {
             // Arity has varied: some builds take a media context as a third argument.
@@ -233,6 +236,7 @@ class VoiceBalancer {
 
     selectLevelSource() {
         const candidates = [
+            () => new VoiceActivityLevelSource(this),
             () => new StatsLevelSource(this),
             () => new AudioElementLevelSource(this)
         ];
@@ -322,6 +326,12 @@ class VoiceBalancer {
 
             // If levels arrive after local volume is applied, back that out so the
             // estimate describes the raw stream and isn't chasing our own changes.
+            //
+            // Treating a post-volume level as pre-volume is safe - the loop just
+            // converges more slowly, via feedback. The reverse is not: subtracting
+            // a gain that was never applied drives volume away from target until it
+            // pins against the clamp. So every source here declares pre-volume
+            // unless it is genuinely certain otherwise.
             let raw = db;
             if (this.source?.isPostVolume) {
                 const vol = this.getVolume(userId);
@@ -471,6 +481,7 @@ class VoiceBalancer {
         push("media engine: " + (engine ? "found" : "MISSING"));
 
         if (engine) {
+            push("  emitter (on/off): " + (typeof engine.on === "function" && typeof engine.off === "function"));
             push("  methods: " + methodsOf(engine).join(", "));
             const conns = this.getConnections();
             push("  connections: " + conns.length);
@@ -637,8 +648,8 @@ class VoiceBalancer {
         slider("slew", "Adjustment strength", 0.05, 1, 0.01, v => `${Math.round(v * 100)}%`);
         note("How much of the correction to apply each pass. Lower is gentler and less likely to pump.");
         slider("minVolume", "Minimum volume", 0, 100, 5, v => `${v}%`);
-        slider("maxVolume", "Maximum volume", 100, 400, 10, v => `${v}%`);
-        note("Discord's own slider stops at 200%, but it stores higher values fine. Raise this if a quiet friend still can't be brought up to everyone else.");
+        slider("maxVolume", "Maximum volume", 100, 200, 5, v => `${v}%`);
+        note("200% is Discord's ceiling. Higher values are accepted locally but get reverted the next time settings sync, so this doesn't go past it.");
         slider("minWindows", "Speech needed before acting", 8, 120, 4, v => `${(v * VoiceBalancer.WINDOW_MS / 1000).toFixed(1)}s`);
         slider("noiseGateDb", "Noise gate", -70, -30, 1, v => `${v} dB`);
         note("Anything quieter than this is treated as room tone, not speech.");
@@ -698,9 +709,101 @@ class VoiceBalancer {
 // -------------------------------------------------------------------------
 
 /**
- * Pulls audioLevel out of the voice connection's WebRTC stats. This is the good
- * path: levels are per-user and arrive pre-playback, so they describe the stream
- * itself rather than what we've already done to it.
+ * The media engine's own per-user voice activity meter:
+ *
+ *     mediaEngine.on("VoiceActivity", (userId, level) => ...)
+ *
+ * This is the path that matters. On the Discord desktop client voice is handled
+ * by the native engine and never reaches the renderer, so there is no element to
+ * tap and no RTCPeerConnection to inspect - but the engine reports activity per
+ * user regardless. Same event on web.
+ *
+ * The level's scale is undocumented, so it is calibrated from observation rather
+ * than assumed. See normalise().
+ */
+class VoiceActivityLevelSource {
+    constructor(plugin) {
+        this.plugin = plugin;
+        this.name = "media-engine-voice-activity";
+        this.isPostVolume = false;
+        this._engine = null;
+        this._handler = null;
+        this._reattach = null;
+        this._peak = 0;
+        this._seen = 0;
+    }
+
+    available() {
+        const engine = this.plugin.getEngine();
+        return !!(engine && typeof engine.on === "function" && typeof engine.off === "function");
+    }
+
+    start(onSample) {
+        this.onSample = onSample;
+        this._handler = (userId, level) => {
+            const linear = this.normalise(level);
+            if (linear !== null) this.onSample(String(userId), linear);
+        };
+        this.attach();
+
+        // The engine is rebuilt on device changes and some reconnects, which
+        // silently drops our listener. Cheap to re-check.
+        this._reattach = setInterval(() => this.attach(), 5000);
+    }
+
+    attach() {
+        const engine = this.plugin.getEngine();
+        if (!engine || engine === this._engine) return;
+        this.detach();
+        try {
+            engine.on("VoiceActivity", this._handler);
+            this._engine = engine;
+            this.plugin.log("attached VoiceActivity listener");
+        } catch (e) {
+            this.plugin.log("VoiceActivity attach failed", e);
+        }
+    }
+
+    detach() {
+        if (!this._engine) return;
+        try { this._engine.off("VoiceActivity", this._handler); } catch (e) { /* ignore */ }
+        this._engine = null;
+    }
+
+    stop() {
+        if (this._reattach) clearInterval(this._reattach);
+        this._reattach = null;
+        this.detach();
+    }
+
+    /**
+     * Map whatever the engine reports onto linear 0..1.
+     *
+     * Discord documents no range for this value. Rather than guess one, watch the
+     * magnitudes actually coming through and pick the interpretation that fits:
+     * negatives are already dBFS, small positives are unit scale, and larger ones
+     * are either percent or raw 16-bit sample values.
+     */
+    normalise(v) {
+        if (typeof v !== "number" || !isFinite(v)) return null;
+        if (v < 0) return fromDb(v);
+        if (v === 0) return null;
+
+        if (v > this._peak) this._peak = v;
+        this._seen++;
+
+        // Provisional guess until there's enough evidence to commit.
+        if (this._seen < 20) return v > 1 ? v / 100 : v;
+
+        if (this._peak <= 1.5) return v;
+        if (this._peak <= 150) return v / 100;
+        return v / 32768;
+    }
+}
+
+/**
+ * Pulls audioLevel out of the voice connection's WebRTC stats. Fallback for
+ * clients where the engine doesn't emit VoiceActivity.
  */
 class StatsLevelSource {
     constructor(plugin) {
@@ -792,13 +895,16 @@ class StatsLevelSource {
 /**
  * Taps any <audio>/<video> element carrying a live MediaStream with the Web Audio
  * API. Works on the browser client and on forks that route voice through the
- * renderer. Levels here are post-volume, so the tracker compensates.
+ * renderer; on Discord desktop there is nothing here to tap.
+ *
+ * Pre-volume, despite appearances: createMediaStreamSource reads the MediaStream,
+ * and the element's .volume applies to playback downstream of that.
  */
 class AudioElementLevelSource {
     constructor(plugin) {
         this.plugin = plugin;
         this.name = "web-audio-tap";
-        this.isPostVolume = true;
+        this.isPostVolume = false;
         this._ctx = null;
         this._taps = new Map();
         this._timer = null;
@@ -914,5 +1020,8 @@ function safeShape(v, depth) {
     if (Array.isArray(v)) return `[${v.length}] ` + (v.length ? safeShape(v[0], depth + 1) : "");
     return "{" + Object.keys(v).slice(0, 20).join(", ") + "}";
 }
+
+// Exposed for test/harness.js.
+VoiceBalancer.sources = { VoiceActivityLevelSource, StatsLevelSource, AudioElementLevelSource };
 
 module.exports = VoiceBalancer;

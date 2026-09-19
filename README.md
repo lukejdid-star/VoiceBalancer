@@ -8,17 +8,23 @@ It remembers people, so the next call starts already balanced.
 
 ---
 
-## Status: alpha — measurement layer needs field verification
+## Status: alpha — works in test, not yet confirmed against a live client
 
-**Read this before installing.**
+The control loop is implemented and tested. Against synthetic speakers it pulls a 19 dB spread down to **3.5 dB** — the remainder being Discord's 200% volume ceiling, not the algorithm. It converges without oscillating and leaves already-balanced channels alone. `node test/harness.js` reproduces all of it.
 
-The control loop is done and tested. Against synthetic speakers it pulls a 19 dB spread down to **0.5 dB**, converges without oscillating, and leaves already-balanced channels alone. You can reproduce that with `node test/harness.js`.
+The measurement layer reads per-user levels from the media engine's `VoiceActivity` event:
 
-What is **not** verified is the part that reads per-user audio levels out of Discord's media engine. Discord has no public API for this, the internals differ between client builds, and it cannot be tested without a live voice call. The plugin therefore probes your client at startup, tries each known strategy in order, and uses the first one that actually produces samples.
+```js
+mediaEngine.on("VoiceActivity", (userId, level) => { ... })
+```
 
-If it can't find one, it says so plainly in its settings panel and does nothing. It will not silently half-work.
+This event is real — it's in Discord's own client type definitions, and it's emitted by the native engine, which is what makes this viable on the desktop app at all. The end-to-end test drives the plugin through exactly this path with a mocked engine and it balances correctly.
 
-**So the first run matters:** join a real voice call with a few people, open the plugin's settings, and look at the Status block. If it shows a source and starts listing people with measured levels, you're good. If it shows `source NONE`, hit **Copy diagnostic report** and open an issue with the output — that report says exactly what your client exposes, and it's what makes this fixable.
+What hasn't happened yet is one run against a real Discord client with real people talking. Two things could still bite: the `level` value's numeric range is undocumented (the plugin calibrates it from observation rather than assuming — see `normalise()`), and the event may only fire under conditions the type definitions don't state.
+
+So **the first live run is the real test.** Join a call with a few people, open the plugin's settings, and look at the Status block. If it shows a source and starts listing people with measured levels, it works. If it shows `source NONE`, or the numbers look wrong, hit **Copy diagnostic report** and open an issue — that report dumps exactly what your client exposes.
+
+The plugin fails safe: if it can't find a level source it says so plainly and does nothing.
 
 ---
 
@@ -36,16 +42,17 @@ Windows path, if you'd rather do it directly:
 
 ## How it works
 
-**Measure.** Every 250 ms the plugin takes the peak audio level for each person who spoke during that window. Peaks rather than averages, because the gaps between words drag an average down and don't reflect how loud someone actually sounds. Anything below the noise gate is discarded as room tone.
+**Measure.** The media engine reports voice activity per user. Every 250 ms the plugin takes the peak of those reports per person — peaks rather than averages, because the gaps between words drag an average down and don't reflect how loud someone actually sounds. Anything below the noise gate is discarded as room tone.
 
 **Estimate.** Each person gets a running loudness figure in dBFS that converges fast over the first few seconds of speech and then settles into a slow average, so one shout doesn't redefine them. Measurements are saved per user ID and reloaded next session.
 
 **Correct.** Once someone has roughly six seconds of measured speech, they're eligible. The plugin takes the median loudness of everyone it's confident about, works out the volume that would put each person at that median, and walks them toward it a third of the way per pass. Gradual, so you don't hear it happening.
 
-Two details that matter:
+Three details that matter:
 
-- **Hysteresis.** It takes a 1.5 dB difference to start correcting someone, but once started it goes all the way to within 0.3 dB. A plain deadzone stops every correction a decibel short of where it belongs — that was a real bug caught by the test harness, and the fix is worth ~2.5 dB.
+- **Hysteresis, not a deadzone.** It takes a 1.5 dB difference to start correcting someone, but once started it goes all the way to within 0.3 dB. A plain deadzone stops every correction about a decibel short of where it belongs — that was a real bug, caught by the harness, worth ~2.5 dB of final spread.
 - **Median, not a fixed target.** Balancing toward the middle of the room keeps the overall mix at the level you're already used to, instead of quietly turning everything down.
+- **Levels are assumed pre-volume.** Treating a post-volume level as pre-volume is safe: the loop just converges more slowly, through feedback. The reverse runs away — subtracting a gain that was never applied drives volume until it pins against the clamp. So sources declare pre-volume unless genuinely certain.
 
 ---
 
@@ -64,9 +71,9 @@ Two details that matter:
 
 ### The 200% ceiling
 
-Discord's own slider stops at 200%, and a genuinely quiet speaker can need more than that to reach everyone else. In testing, a person 9 dB below the room needed 282%.
+This is a hard limit and the main thing standing between the plugin and a perfect result. A genuinely quiet speaker can need more than 200% to reach everyone else — in testing, someone 9 dB below the room needed 282%.
 
-`setLocalVolume` stores higher values perfectly well, so **Maximum volume** goes to 400%. Raising it is the difference between a 3.5 dB residual spread and a 0.5 dB one. It's off by default because it's beyond what Discord's UI will show you.
+`setLocalVolume` accepts higher values, but Discord's audio context settings sync overwrites them the next time it runs, so they silently snap back. Working around that needs a webpack-level patch of the sync itself, which is what Vencord's VolumeBooster does. VoiceBalancer doesn't attempt it, and caps at 200%.
 
 ---
 
@@ -86,7 +93,7 @@ Discord's own slider stops at 200%, and a genuinely quiet speaker can need more 
 node test/harness.js
 ```
 
-Drives the control loop with synthetic speakers: a realistic friend group, a pathological case that hits the volume ceiling, and an already-balanced channel that should stay put. The harness mocks Discord entirely, so it verifies the maths and nothing about the integration.
+Nine checks across three areas: control-loop convergence against synthetic speakers (realistic, pathological, and already-balanced channels), level-scale calibration against four plausible encodings of the engine's undocumented value, and an end-to-end run through the real `VoiceActivity` wiring with a mocked engine. Discord is mocked throughout, so this verifies the logic and nothing about the live integration.
 
 ---
 

@@ -92,6 +92,80 @@ console.log(a.spreadAfter < 4 ? "PASS realistic spread collapsed" : "FAIL realis
 console.log(b.spreadAfter < b.spreadBefore ? "PASS extreme improved (ceiling-limited)" : "FAIL extreme got worse");
 console.log(c.spreadAfter <= c.spreadBefore + 0.5 ? "PASS balanced case stayed stable" : "FAIL balanced case drifted");
 
-// With the ceiling raised past Discord's own 200% slider limit.
-const d = run("realistic spread, maxVolume 400", { loudmouth: -14, normal: -24, quiet: -33 }, { maxVolume: 400 });
-console.log(d.spreadAfter < 1.5 ? "PASS raised ceiling nails it" : "FAIL still " + d.spreadAfter.toFixed(1));
+
+// --- level scale calibration -------------------------------------------
+// The engine's VoiceActivity value has no documented range, so the source
+// infers it. Check each plausible encoding lands in linear 0..1.
+const { VoiceActivityLevelSource } = VoiceBalancer.sources;
+
+function calibrate(label, values, expectPeakNear) {
+    const src = new VoiceActivityLevelSource({ log: () => {}, getEngine: () => null });
+    let out = [];
+    // feed twice: once to build evidence, once to read committed scale
+    for (let pass = 0; pass < 2; pass++) out = values.map(v => src.normalise(v));
+    const peak = Math.max(...out.filter(v => v !== null));
+    const ok = Math.abs(peak - expectPeakNear) < 0.15;
+    console.log(`${ok ? "PASS" : "FAIL"} scale ${label.padEnd(22)} peak -> ${peak.toFixed(3)} (want ~${expectPeakNear})`);
+    return ok;
+}
+
+console.log("");
+const unit    = Array.from({length: 30}, (_, i) => (i + 1) / 30);          // 0..1
+const percent = Array.from({length: 30}, (_, i) => ((i + 1) / 30) * 100);  // 0..100
+const pcm16   = Array.from({length: 30}, (_, i) => ((i + 1) / 30) * 32768); // 0..32768
+const dbfs    = Array.from({length: 30}, (_, i) => -60 + i * 2);            // negative dBFS
+
+calibrate("unit 0..1", unit, 1.0);
+calibrate("percent 0..100", percent, 1.0);
+calibrate("pcm16 0..32768", pcm16, 1.0);
+calibrate("dbfs negative", dbfs, Math.pow(10, -2 / 20));
+
+// --- end-to-end through the real VoiceActivity wiring -------------------
+// Mocks the media engine as an emitter and drives the plugin the way Discord
+// would: engine emits (userId, level), plugin measures, plugin sets volumes.
+console.log("");
+(function endToEnd() {
+    const listeners = {};
+    const engine = {
+        on: (ev, fn) => { (listeners[ev] ||= []).push(fn); },
+        off: (ev, fn) => { listeners[ev] = (listeners[ev] || []).filter(f => f !== fn); },
+        connections: new Set()
+    };
+    const emit = (ev, ...a) => (listeners[ev] || []).forEach(f => f(...a));
+
+    const volumes = new Map([["loud", 100], ["soft", 100]]);
+    const truth = { loud: -14, soft: -32 };
+
+    const p = new VoiceBalancer({ version: "e2e" });
+    p.MediaEngineStore = { getLocalVolume: id => volumes.get(id) ?? 100, getMediaEngine: () => engine };
+    p.VolumeActions = { setLocalVolume: (id, v) => volumes.set(id, v) };
+    p.SelectedChannelStore = { getVoiceChannelId: () => "c" };
+    p.UserStore = { getCurrentUser: () => ({ id: "me" }), getUser: id => ({ username: id }) };
+    p.VoiceStateStore = { getVoiceStatesForChannel: () => ({ me: {}, loud: {}, soft: {} }) };
+    p.SpeakingStore = { isSpeaking: () => false };
+
+    const src = p.selectLevelSource();
+    if (!src || src.name !== "media-engine-voice-activity") {
+        console.log("FAIL e2e: expected VoiceActivity source, got " + (src && src.name));
+        return;
+    }
+    src.start((id, lin) => p.onSample(id, lin));
+
+    // Engine reports on a 0..100 scale here; the source must work that out.
+    for (let turn = 0; turn < 14; turn++) {
+        for (const id of ["loud", "soft"]) {
+            for (let w = 0; w < 6; w++) {
+                emit("VoiceActivity", id, fromDb(truth[id]) * 100);
+                p.closeWindow();
+            }
+        }
+        p.adjustPass();
+    }
+    src.stop();
+
+    const perceived = id => truth[id] + toDb(volumes.get(id) / 100);
+    const spread = Math.abs(perceived("loud") - perceived("soft"));
+    console.log(`e2e  loud ${volumes.get("loud").toFixed(0)}%  soft ${volumes.get("soft").toFixed(0)}%  spread ${spread.toFixed(1)}dB (was 18.0)`);
+    console.log(spread < 4 ? "PASS e2e VoiceActivity path balances" : "FAIL e2e spread " + spread.toFixed(1));
+    console.log(listeners.VoiceActivity.length === 0 ? "PASS e2e listener detached on stop" : "FAIL e2e listener leaked");
+})();
