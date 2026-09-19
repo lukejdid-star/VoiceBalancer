@@ -19,13 +19,35 @@ class VoiceBalancer {
         return {
             enabled: true,
 
+            // "lock" rides each person's gain in real time so every voice arrives at
+            // targetDb - the closest thing to a single compressor that Discord's
+            // plugin surface allows. "learn" instead settles on one volume per person
+            // from their average speaking level, which is steadier but slower to react.
+            mode: "lock",
+
+            // Level lock. Attack is deliberately faster than release: clamp a shout
+            // immediately, bring a quiet passage up gently so room tone doesn't swell.
+            attack: 0.55,
+            release: 0.08,
+            updateHz: 6,
+
+            // Pull targetDb into a range every speaker can actually reach. A person
+            // 30 dB below the loudest cannot be lifted to a high target when gain
+            // stops at maxVolume, so the target is pushed down until they fit. This
+            // is not balancing relative to the room - it still picks one absolute
+            // level for everyone, just one that is achievable.
+            autoTarget: true,
+
             // Target loudness. "median" keeps the overall mix at roughly the level
             // you're used to; "fixed" pins everyone to targetDb instead.
             targetMode: "median",
-            targetDb: -26,
+            targetDb: -22,
 
-            // Volume clamp, in Discord's 0-200 percent scale.
-            minVolume: 30,
+            // Volume clamp, in Discord's 0-200 percent scale. The floor is low on
+            // purpose: a hot mic can peak near 0 dBFS and needs to come down to
+            // roughly a tenth to sit at targetDb. It exists to stop a bad
+            // measurement silencing someone, not to keep everyone comfortable.
+            minVolume: 8,
             maxVolume: 200,
 
             // How much of the correction to apply per adjustment pass. Lower is
@@ -40,7 +62,11 @@ class VoiceBalancer {
             minWindows: 24,
 
             // Ignore anything quieter than this - room tone, keyboard, breathing.
-            noiseGateDb: -52,
+            // Measured speech peaks in a real call ran -11 to -30 dBFS, while trail-offs
+            // and room noise sat below -40. A gate at -52 let that noise into people's
+            // learned levels, which dragged the shared target down and slammed genuine
+            // speakers into the volume floor.
+            noiseGateDb: -40,
 
             // Seconds between adjustment passes.
             adjustInterval: 4,
@@ -70,6 +96,18 @@ class VoiceBalancer {
     // Once a correction is underway, how close we get before calling it done.
     static get SETTLE_DB() { return 0.3; }
 
+    // Level lock holds a decaying peak rather than a symmetric average: a smoothed
+    // mean slides toward silence between words, and gain chasing it downward means
+    // the next syllable arrives at full boost. Decay is slow enough to ride out
+    // pauses, and gain is frozen entirely once someone stops talking.
+    static get PEAK_DECAY_DB_PER_SEC() { return 6; }
+    static get SPEECH_HOLD_MS() { return 600; }
+
+    // How far below someone's own learned speaking level still counts as them
+    // speaking. An absolute gate can't tell a quiet person talking from a loud
+    // person trailing off, and gain set on a trail-off is gain set far too high.
+    static get SPEECH_RANGE_DB() { return 10; }
+
     // ---------------------------------------------------------------------
     // Lifecycle
     // ---------------------------------------------------------------------
@@ -81,8 +119,10 @@ class VoiceBalancer {
         // Runtime state, all keyed by user ID.
         this.tracked = new Map();     // id -> { db, windows, applied, original, manual }
         this.window = new Map();      // id -> peak linear level in the current window
+        this.shortTerm = new Map();   // id -> smoothed linear level, for "lock" mode
         this.source = null;
         this.probeReport = null;
+        this._target = null;
         this._applying = false;
         this._timers = [];
     }
@@ -114,6 +154,7 @@ class VoiceBalancer {
 
         this._timers.push(setInterval(() => this.closeWindow(), VoiceBalancer.WINDOW_MS));
         this._timers.push(setInterval(() => this.adjustPass(), this.settings.adjustInterval * 1000));
+        this._timers.push(setInterval(() => this.lockPass(), Math.round(1000 / 12)));
     }
 
     stop() {
@@ -236,8 +277,8 @@ class VoiceBalancer {
 
     selectLevelSource() {
         const candidates = [
-            () => new VoiceActivityLevelSource(this),
             () => new StatsLevelSource(this),
+            () => new VoiceActivityLevelSource(this),
             () => new AudioElementLevelSource(this)
         ];
 
@@ -293,7 +334,7 @@ class VoiceBalancer {
     // ---------------------------------------------------------------------
 
     blank(extra) {
-        return Object.assign({ db: null, windows: 0, applied: null, original: null, manual: false, correcting: false }, extra || {});
+        return Object.assign({ db: null, windows: 0, applied: null, original: null, manual: false, correcting: false, lastApplied: 0 }, extra || {});
     }
 
     onSample(userId, linear) {
@@ -311,6 +352,20 @@ class VoiceBalancer {
 
         const prev = this.window.get(userId) || 0;
         if (linear > prev) this.window.set(userId, linear);
+
+        // Level lock rides a decaying peak so it reacts within a syllable without
+        // chasing the gaps between words down into silence.
+        const now = Date.now();
+        const held = this.shortTerm.get(userId);
+        if (!held) {
+            this.shortTerm.set(userId, { v: linear, t: now, lastLoud: now });
+        } else {
+            const dt = Math.max(0, now - held.t) / 1000;
+            const decayed = held.v * fromDb(-VoiceBalancer.PEAK_DECAY_DB_PER_SEC * dt);
+            if (linear >= decayed) { held.v = linear; held.lastLoud = now; }
+            else held.v = decayed;
+            held.t = now;
+        }
     }
 
     // Fold each window's peak into that user's running loudness estimate.
@@ -359,8 +414,110 @@ class VoiceBalancer {
     // Correction
     // ---------------------------------------------------------------------
 
+    /**
+     * Level lock: ride each speaker's gain so their voice arrives at targetDb no
+     * matter how loud they are right now.
+     *
+     * This is the nearest thing to a single compressor between you and the channel.
+     * Discord decodes voice natively, so there is no mixed stream in the renderer to
+     * process - per-user gain is the only handle. Running it per user also separates
+     * people talking over each other, which one gate on the mix could not do.
+     */
+    lockPass() {
+        if (!this.settings.enabled || this.settings.mode !== "lock") return;
+        if (this.shortTerm.size === 0) return;
+
+        const target = this.lockTarget();
+        const now = Date.now();
+        const minGap = 1000 / Math.max(1, this.settings.updateHz);
+        const inChannel = new Set(this.peers());
+
+        for (const [userId, held] of this.shortTerm) {
+            if (!inChannel.has(userId)) { this.shortTerm.delete(userId); continue; }
+            if (this.settings.ignored.includes(userId)) continue;
+
+            // Freeze gain through pauses. Adjusting someone who has stopped talking
+            // means the next word they say arrives at whatever gain silence implied.
+            if (now - held.lastLoud > VoiceBalancer.SPEECH_HOLD_MS) continue;
+
+            const db = toDb(held.v);
+            if (db < this.settings.noiseGateDb) continue;
+
+            let t = this.tracked.get(userId);
+            if (!t) { t = this.blank(); this.tracked.set(userId, t); }
+            if (t.manual) continue;
+
+            // Only ride gain while they are actually speaking at something like
+            // their normal level. Discord's own detector stays on through trail-offs
+            // and breath, and following those pushes gain up so the next real word
+            // arrives far too loud - which is exactly what was observed live.
+            if (t.db !== null && t.windows >= 6 && db < t.db - VoiceBalancer.SPEECH_RANGE_DB) continue;
+
+            if (now - (t.lastApplied || 0) < minGap) continue;
+
+            const current = this.getVolume(userId);
+            if (current <= 0) continue;
+            if (t.original === null) t.original = current;
+
+            const wanted = clamp(
+                100 * fromDb(target - db),
+                this.settings.minVolume,
+                this.settings.maxVolume
+            );
+
+            // Only write when it is worth writing. Every call reaches the native
+            // engine and Discord's settings sync, so small corrections are noise.
+            if (Math.abs(toDb(Math.max(wanted, 1)) - toDb(Math.max(current, 1))) < 0.7) continue;
+
+            this.setVolume(userId, wanted);
+            t.applied = wanted;
+            t.lastApplied = now;
+        }
+    }
+
+    /**
+     * The level every voice is driven to.
+     *
+     * Volume is bounded, so a target is only meaningful if each speaker can reach it:
+     * the quietest needs target <= raw + gain(maxVolume), the loudest needs
+     * target >= raw + gain(minVolume). Where the room does not fit inside that range
+     * the quietest speaker wins, since being too loud is the more painful failure.
+     */
+    lockTarget() {
+        const wanted = this.settings.targetDb;
+        if (!this.settings.autoTarget) return wanted;
+
+        // Use each person's learned speaking level, not whatever their signal is
+        // doing this instant. Live values include decaying tails from people who
+        // stopped talking, and those dragged the target down toward silence.
+        const levels = [];
+        for (const [userId, t] of this.tracked) {
+            if (this.settings.ignored.includes(userId)) continue;
+            // Enough speech to be a real measurement. One or two windows of noise
+            // should never get a vote on the level everyone else is driven to.
+            if (t.db === null || t.windows < 20) continue;
+            if (t.db >= this.settings.noiseGateDb) levels.push(t.db);
+        }
+        if (!levels.length) return wanted;
+
+        const ceiling = Math.min(...levels) + toDb(this.settings.maxVolume / 100);
+        const floor = Math.max(...levels) + toDb(Math.max(this.settings.minVolume, 1) / 100);
+
+        const fit = ceiling < floor ? ceiling : clamp(wanted, floor, ceiling);
+
+        // Hold the chosen target still. Learned levels keep moving as people talk,
+        // and re-deriving the target every pass makes everyone's volume drift even
+        // when nothing about the room actually changed. Only move when the current
+        // target has become unreachable, and then only part of the way.
+        if (this._target === undefined || this._target === null) { this._target = fit; return fit; }
+        if (this._target >= floor - 0.5 && this._target <= ceiling + 0.5) return this._target;
+        this._target += (fit - this._target) * 0.25;
+        return this._target;
+    }
+
     adjustPass() {
         if (!this.settings.enabled) return;
+        if (this.settings.mode === "lock") return;   // lockPass owns the volumes
 
         const ready = this.confident();
         if (ready.length === 0) return;
@@ -647,11 +804,11 @@ class VoiceBalancer {
         section("Tuning");
         slider("slew", "Adjustment strength", 0.05, 1, 0.01, v => `${Math.round(v * 100)}%`);
         note("How much of the correction to apply each pass. Lower is gentler and less likely to pump.");
-        slider("minVolume", "Minimum volume", 0, 100, 5, v => `${v}%`);
+        slider("minVolume", "Minimum volume", 2, 100, 2, v => `${v}%`);
         slider("maxVolume", "Maximum volume", 100, 200, 5, v => `${v}%`);
         note("200% is Discord's ceiling. Higher values are accepted locally but get reverted the next time settings sync, so this doesn't go past it.");
         slider("minWindows", "Speech needed before acting", 8, 120, 4, v => `${(v * VoiceBalancer.WINDOW_MS / 1000).toFixed(1)}s`);
-        slider("noiseGateDb", "Noise gate", -70, -30, 1, v => `${v} dB`);
+        slider("noiseGateDb", "Noise gate", -60, -20, 1, v => `${v} dB`);
         note("Anything quieter than this is treated as room tone, not speech.");
 
         // --- data ---
@@ -802,21 +959,33 @@ class VoiceActivityLevelSource {
 }
 
 /**
- * Pulls audioLevel out of the voice connection's WebRTC stats. Fallback for
- * clients where the engine doesn't emit VoiceActivity.
+ * Per-user audio levels from the voice connection's RTP stats.
+ *
+ *     (await connection.getStats()).rtp.inbound[userId][0].audioLevel
+ *
+ * Verified against Discord 1.0.9258: `inbound` is keyed by user ID directly - no
+ * SSRC mapping needed - and each entry carries a linear 0..1 `audioLevel` plus
+ * `audioDetected`, Discord's own voice-activity flag, which gates out silence
+ * better than a threshold can.
+ *
+ * getStats() measured at ~1.25ms per call and the level refreshes at roughly 8Hz,
+ * so polling at 100ms is cheap and loses nothing.
  */
 class StatsLevelSource {
     constructor(plugin) {
         this.plugin = plugin;
-        this.name = "webrtc-stats";
+        this.name = "rtp-stats";
         this.isPostVolume = false;
         this._timer = null;
+        this._busy = false;
         this._ssrcToUser = new Map();
     }
 
+    // Connections only exist while in a call, and the plugin usually starts
+    // before that. An engine is enough - polling simply yields nothing until
+    // there's something to poll.
     available() {
-        const conns = this.plugin.getConnections();
-        return conns.some(c => typeof c.getStats === "function");
+        return !!this.plugin.getEngine();
     }
 
     start(onSample) {
@@ -838,57 +1007,80 @@ class StatsLevelSource {
 
     async collect() {
         for (const conn of this.plugin.getConnections()) {
-            if (typeof conn.getStats !== "function") continue;
-
-            this.learnSsrcMap(conn);
+            if (typeof conn.getStats !== "function" || conn.destroyed) continue;
 
             let stats;
             try { stats = await conn.getStats(); } catch (e) { continue; }
             if (!stats) continue;
 
-            // Standard RTCStatsReport.
-            if (typeof stats.forEach === "function" && !Array.isArray(stats)) {
-                stats.forEach(r => {
-                    if (r && r.type === "inbound-rtp" && typeof r.audioLevel === "number") {
-                        this.emit(r.ssrc, r.audioLevel);
-                    }
-                });
-                continue;
-            }
+            if (this.readRtpInbound(stats)) continue;
+            this.readGenericShapes(conn, stats);
+        }
+    }
 
-            // Discord's own shape: { inbound: [...] }.
-            const inbound = stats.inbound || stats.inboundRtp || stats.receivers;
-            if (Array.isArray(inbound)) {
-                for (const r of inbound) {
-                    const lvl = r.audioLevel ?? r.audio_level ?? r.level;
-                    if (typeof lvl === "number") this.emit(r.ssrc ?? r.userId ?? null, lvl);
+    // The shape Discord actually uses.
+    readRtpInbound(stats) {
+        const inbound = stats.rtp && stats.rtp.inbound;
+        if (!inbound || typeof inbound !== "object" || Array.isArray(inbound)) return false;
+
+        let matched = false;
+        for (const userId of Object.keys(inbound)) {
+            const entry = inbound[userId];
+            const audio = Array.isArray(entry)
+                ? entry.find(e => e && e.type === "audio")
+                : entry;
+            if (!audio || typeof audio.audioLevel !== "number") continue;
+
+            matched = true;
+
+            // Discord already ran a voice activity detector over this stream;
+            // trust it rather than guessing from the level alone.
+            if (audio.audioDetected === 0) continue;
+            if (audio.audioLevel <= 0) continue;
+
+            this.onSample(String(userId), audio.audioLevel);
+        }
+        return matched;
+    }
+
+    // Fallbacks for builds that report stats some other way.
+    readGenericShapes(conn, stats) {
+        if (typeof stats.forEach === "function" && !Array.isArray(stats)) {
+            stats.forEach(r => {
+                if (r && r.type === "inbound-rtp" && typeof r.audioLevel === "number") {
+                    this.emitBySsrc(conn, r.ssrc, r.audioLevel);
                 }
+            });
+            return;
+        }
+
+        const inbound = stats.inbound || stats.inboundRtp || stats.receivers;
+        if (Array.isArray(inbound)) {
+            for (const r of inbound) {
+                const lvl = r.audioLevel != null ? r.audioLevel : (r.audio_level != null ? r.audio_level : r.level);
+                if (typeof lvl === "number") this.emitBySsrc(conn, r.ssrc != null ? r.ssrc : r.userId, lvl);
             }
         }
     }
 
-    // Connections generally carry some ssrc -> user mapping; the key name has
-    // moved around, so accept any of the plausible ones.
+    emitBySsrc(conn, key, level) {
+        if (typeof key === "string" && /^\d{15,}$/.test(key)) return this.onSample(key, level);
+        this.learnSsrcMap(conn);
+        const userId = key == null ? null : this._ssrcToUser.get(String(key)) || null;
+        this.onSample(userId, level); // null falls through to speaking-based attribution
+    }
+
     learnSsrcMap(conn) {
         const candidate = conn.ssrcMap || conn.ssrcs || conn._ssrcMap || conn.userSsrcs;
         if (!candidate) return;
         try {
             const entries = candidate instanceof Map ? candidate.entries() : Object.entries(candidate);
             for (const [k, v] of entries) {
-                // Mapping may run either direction depending on build.
                 if (typeof v === "string" && /^\d{15,}$/.test(v)) this._ssrcToUser.set(String(k), v);
                 else if (v && typeof v === "object" && v.audioSsrc) this._ssrcToUser.set(String(v.audioSsrc), String(k));
                 else if (typeof v === "number") this._ssrcToUser.set(String(v), String(k));
             }
         } catch (e) { /* mapping unavailable */ }
-    }
-
-    emit(ssrc, level) {
-        // A raw snowflake means the stats were already user-keyed.
-        if (typeof ssrc === "string" && /^\d{15,}$/.test(ssrc)) return this.onSample(ssrc, level);
-        const userId = ssrc == null ? null : this._ssrcToUser.get(String(ssrc)) || null;
-        // Unmapped samples fall through to speaking-based attribution.
-        this.onSample(userId, level);
     }
 }
 

@@ -21,7 +21,7 @@ const fromDb = d => Math.pow(10, d / 20);
 
 function run(label, speakers, opts) {
     const p = new VoiceBalancer({ version: "test" });
-    Object.assign(p.settings, opts || {});
+    Object.assign(p.settings, { mode: "learn" }, opts || {});
 
     const volumes = new Map();
     const ids = Object.keys(speakers);
@@ -120,52 +120,119 @@ calibrate("percent 0..100", percent, 1.0);
 calibrate("pcm16 0..32768", pcm16, 1.0);
 calibrate("dbfs negative", dbfs, Math.pow(10, -2 / 20));
 
-// --- end-to-end through the real VoiceActivity wiring -------------------
-// Mocks the media engine as an emitter and drives the plugin the way Discord
-// would: engine emits (userId, level), plugin measures, plugin sets volumes.
+// --- end-to-end through the real RTP stats shape -----------------------
+// getStats() payload mirrors what Discord 1.0.9258 actually returns, captured
+// live: rtp.inbound keyed by user ID, each entry carrying audioLevel and
+// audioDetected. Levels are the real ones observed in a call.
 console.log("");
-(function endToEnd() {
-    const listeners = {};
-    const engine = {
-        on: (ev, fn) => { (listeners[ev] ||= []).push(fn); },
-        off: (ev, fn) => { listeners[ev] = (listeners[ev] || []).filter(f => f !== fn); },
-        connections: new Set()
+(function endToEndStats() {
+    const truth = { jake: 0.975, trigger: 0.433 };   // measured live
+    const volumes = new Map([["jake", 100], ["trigger", 100]]);
+    let speaking = null;
+
+    const conn = {
+        destroyed: false,
+        getStats: async () => ({
+            mediaEngineConnectionId: "Native-0",
+            rtp: {
+                inbound: Object.fromEntries(Object.keys(truth).map(id => [id, [{
+                    type: "audio",
+                    ssrc: 1583,
+                    audioLevel: id === speaking ? truth[id] * (0.7 + Math.random() * 0.3) : 0,
+                    audioDetected: id === speaking ? 1 : 0
+                }]])),
+                outbound: [{ type: "audio", ssrc: 3014, audioLevel: 0.001 }]
+            }
+        })
     };
-    const emit = (ev, ...a) => (listeners[ev] || []).forEach(f => f(...a));
 
-    const volumes = new Map([["loud", 100], ["soft", 100]]);
-    const truth = { loud: -14, soft: -32 };
-
+    const engine = { connections: new Set([conn]), on() {}, off() {} };
     const p = new VoiceBalancer({ version: "e2e" });
+    p.settings.mode = "learn";
     p.MediaEngineStore = { getLocalVolume: id => volumes.get(id) ?? 100, getMediaEngine: () => engine };
     p.VolumeActions = { setLocalVolume: (id, v) => volumes.set(id, v) };
     p.SelectedChannelStore = { getVoiceChannelId: () => "c" };
     p.UserStore = { getCurrentUser: () => ({ id: "me" }), getUser: id => ({ username: id }) };
-    p.VoiceStateStore = { getVoiceStatesForChannel: () => ({ me: {}, loud: {}, soft: {} }) };
+    p.VoiceStateStore = { getVoiceStatesForChannel: () => ({ me: {}, jake: {}, trigger: {} }) };
     p.SpeakingStore = { isSpeaking: () => false };
 
     const src = p.selectLevelSource();
-    if (!src || src.name !== "media-engine-voice-activity") {
-        console.log("FAIL e2e: expected VoiceActivity source, got " + (src && src.name));
+    if (!src || src.name !== "rtp-stats") {
+        console.log("FAIL e2e: expected rtp-stats source, got " + (src && src.name));
         return;
     }
     src.start((id, lin) => p.onSample(id, lin));
 
-    // Engine reports on a 0..100 scale here; the source must work that out.
-    for (let turn = 0; turn < 14; turn++) {
-        for (const id of ["loud", "soft"]) {
-            for (let w = 0; w < 6; w++) {
-                emit("VoiceActivity", id, fromDb(truth[id]) * 100);
-                p.closeWindow();
+    (async () => {
+        for (let turn = 0; turn < 16; turn++) {
+            for (const id of Object.keys(truth)) {
+                speaking = id;
+                for (let w = 0; w < 6; w++) {
+                    await src.collect();   // one poll
+                    p.closeWindow();
+                }
             }
+            p.adjustPass();
         }
-        p.adjustPass();
-    }
-    src.stop();
+        src.stop();
 
-    const perceived = id => truth[id] + toDb(volumes.get(id) / 100);
-    const spread = Math.abs(perceived("loud") - perceived("soft"));
-    console.log(`e2e  loud ${volumes.get("loud").toFixed(0)}%  soft ${volumes.get("soft").toFixed(0)}%  spread ${spread.toFixed(1)}dB (was 18.0)`);
-    console.log(spread < 4 ? "PASS e2e VoiceActivity path balances" : "FAIL e2e spread " + spread.toFixed(1));
-    console.log(listeners.VoiceActivity.length === 0 ? "PASS e2e listener detached on stop" : "FAIL e2e listener leaked");
+        const perceived = id => toDb(truth[id]) + toDb(volumes.get(id) / 100);
+        const spread = Math.abs(perceived("jake") - perceived("trigger"));
+        const before = Math.abs(toDb(truth.jake) - toDb(truth.trigger));
+        console.log(`e2e  jake ${volumes.get("jake").toFixed(0)}%  trigger ${volumes.get("trigger").toFixed(0)}%  spread ${before.toFixed(1)}dB -> ${spread.toFixed(1)}dB`);
+        console.log(spread < 2 ? "PASS e2e rtp-stats path balances real levels" : "FAIL e2e spread " + spread.toFixed(1));
+
+        // audioDetected must gate silence out entirely
+        const silentSeen = p.tracked.size === 2;
+        console.log(silentSeen ? "PASS e2e only real speakers tracked" : "FAIL e2e tracked " + p.tracked.size);
+    })();
+})();
+
+// --- level lock -------------------------------------------------------
+// Rides gain in real time so every voice lands on targetDb, rather than
+// settling on one volume per person.
+console.log("");
+(function levelLock() {
+    const truth = { jake: 0.975, trigger: 0.433, nami: 0.06 };
+    const volumes = new Map(Object.keys(truth).map(id => [id, 100]));
+    const p = new VoiceBalancer({ version: "lock" });
+    Object.assign(p.settings, { mode: "lock" });   // otherwise plugin defaults
+    p.MediaEngineStore = { getLocalVolume: id => volumes.get(id) ?? 100 };
+    p.VolumeActions = { setLocalVolume: (id, v) => volumes.set(id, v) };
+    p.SelectedChannelStore = { getVoiceChannelId: () => "c" };
+    p.UserStore = { getCurrentUser: () => ({ id: "me" }), getUser: id => ({ username: id }) };
+    p.VoiceStateStore = { getVoiceStatesForChannel: () => ({ me: {}, jake: {}, trigger: {}, nami: {} }) };
+    p.SpeakingStore = { isSpeaking: () => false };
+    p.source = { name: "h", isPostVolume: false, stop() {} };
+
+    // everyone talks simultaneously - the case a single gate on the mix cannot fix
+    let clock = 0;
+    const origNow = Date.now;
+    Date.now = () => origNow() + (clock += 200);
+    for (let i = 0; i < 120; i++) {
+        for (const id of Object.keys(truth)) p.onSample(id, truth[id] * (0.8 + Math.random() * 0.4));
+        p.lockPass();
+    }
+    Date.now = origNow;
+
+    const perceived = id => toDb(truth[id]) + toDb(volumes.get(id) / 100);
+    const rows = Object.keys(truth).map(id => `${id} ${volumes.get(id).toFixed(0)}% -> ${perceived(id).toFixed(1)}dB`);
+    console.log("lock  " + rows.join("   "));
+    const vals = Object.keys(truth).map(perceived);
+    const spread = Math.max(...vals) - Math.min(...vals);
+    const before = Math.max(...Object.values(truth).map(toDb)) - Math.min(...Object.values(truth).map(toDb));
+    console.log(`lock  spread ${before.toFixed(1)}dB -> ${spread.toFixed(1)}dB`);
+    console.log(spread < 3.5 ? "PASS lock equalises simultaneous speakers" : "FAIL lock spread " + spread.toFixed(1));   // peak-hold decay against jittered input leaves ~1dB
+
+    // must not write on every tick - each write hits the native engine + settings sync
+    let writes = 0;
+    p.VolumeActions.setLocalVolume = (id, v) => { writes++; volumes.set(id, v); };
+    clock = 0; Date.now = () => origNow() + (clock += 200);
+    for (let i = 0; i < 120; i++) {
+        for (const id of Object.keys(truth)) p.onSample(id, truth[id]);
+        p.lockPass();
+    }
+    Date.now = origNow;
+    console.log(`lock  writes while steady: ${writes} over 360 samples`);
+    console.log(writes < 20 ? "PASS lock stays quiet once settled" : "FAIL lock wrote " + writes);
 })();
